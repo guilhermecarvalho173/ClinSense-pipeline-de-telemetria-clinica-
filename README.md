@@ -1,6 +1,6 @@
 # ClinSense Fisio Center — Plataforma IoT & Big Data de Telemonitoramento
 
-Plataforma de telemonitoramento biomédico contínuo para **40 pacientes crônicos** (pulseiras vestíveis ESP32-S3), construída sobre arquitetura orientada a eventos com ingestão segura **MQTTS (mTLS X.509)** e processamento paralelo em camadas quente e fria (**Caminho B**: Eclipse Mosquitto + LocalStack 3.8 + Terraform + DuckDB).
+Plataforma de telemonitoramento biomédico contínuo para **40 pacientes crônicos** (pulseiras vestíveis ESP32-S3), construída sobre arquitetura orientada a eventos com ingestão segura **MQTTS (mTLS X.509)**, processamento paralelo em camadas quente e fria (**Caminho B**: Eclipse Mosquitto + LocalStack 3.8 + Terraform + DuckDB) e **Dashboard de telemonitoramento em tempo real (Streamlit)**.
 
 ---
 
@@ -30,10 +30,11 @@ A solução adota o padrão **Arquitetura Lambda** em execução local container
     ▼                 └──► Se BPM > 120, BPM < 50 ou SpO2 < 92%:
 [S3: clinsense-raw-lake]       ├──► [SNS: clinsense-alertas] ──► [SQS Audit]
 (JSON cru particionado         └──► [DynamoDB: clinsense_alertas] (TTL 30d)
- year/month/day/hour)
-    │
-    ▼
-[DuckDB Analytics SQL] (read_json_auto + Hive Partitioning)
+ year/month/day/hour)                        │
+    │                                        │
+    ├──────────────────┬─────────────────────┘
+    ▼                  ▼
+[DuckDB SQL]    [Dashboard Streamlit (Porta 8501)]
 ```
 
 ### Componentes Principais
@@ -44,6 +45,7 @@ A solução adota o padrão **Arquitetura Lambda** em execução local container
 | **Ingestão Paralela** | Python (`paho-mqtt` + `boto3`) | Consome `clinsense/telemetry/#` e despacha simultaneamente cada leitura para o Firehose (camada fria) e para a Lambda (camada quente). |
 | **Camada Quente & Alertas** | AWS Lambda + DynamoDB + SNS/SQS | Persiste leituras em `clinsense_quente` (TTL 24h) e avalia regras clínicas ($BPM > 120$, $BPM < 50$ ou $SpO_2 < 92\%$), disparando alertas no SNS `clinsense-alertas` e gravando em `clinsense_alertas` (TTL 30 dias). |
 | **Camada Fria (Data Lake)** | Amazon Data Firehose + Amazon S3 | Grava registros em JSON cru (NDJSON) no bucket `clinsense-raw-lake` com particionamento temporal (`year/month/day/hour`) e *buffer* de 1 MB ou 5 segundos. |
+| **Visualização em Tempo Real** | Streamlit + Boto3 + DuckDB (dashboard/) | Painel web containerizado na porta 8501 com atualização automática a cada 2s, exibindo KPIs clínicos, gráficos de BPM/SpO2 da frota, tabela de alertas críticos e auditoria DuckDB no S3. |
 | **Analytics & Auditoria** | DuckDB | Executa consultas SQL diretamente sobre os objetos JSON particionados do S3 (`read_json_auto(..., hive_partitioning=true)`), sem necessidade de jobs ETL intermediários para Parquet. |
 | **Infraestrutura como Código** | Terraform (`terraform/main.tf`) | Provisiona declarativamente no LocalStack recursos auditáveis (`clinsense-tf-raw-lake`, `clinsense_tf_quente` com TTL e `clinsense-tf-alertas`). |
 
@@ -57,6 +59,9 @@ clinsense-iot-bigdata/
 │   ├── ca.crt / ca.key            # Autoridade Certificadora raiz (ClinSense-Root-CA)
 │   ├── broker.crt / broker.key    # Certificado TLS do broker Mosquitto (SAN localhost / 127.0.0.1)
 │   └── shared-device.crt / .key   # Certificado X.509 compartilhado pelas 40 pulseiras ESP32-S3
+├── dashboard/                     # Interface visual de telemonitoramento em tempo real (Docker)
+│   ├── app.py                     # Aplicação Streamlit (DynamoDB quente/alertas + consulta S3 DuckDB)
+│   └── Dockerfile                 # Imagem Python 3.11-slim do serviço clinsense-dashboard (porta 8501)
 ├── docs/
 │   └── ADR-001-pipeline.md        # Decisão arquitetural: Caminho B + JSON cru vs. Kafka + Parquet
 ├── lambda/                        # Diretório auxiliar para artefatos e empacotamento Lambda
@@ -79,7 +84,7 @@ clinsense-iot-bigdata/
 │   └── query_duckdb.py            # [Auxiliar/Legado] Consulta ad-hoc DuckDB sobre Raw Lake
 ├── terraform/
 │   └── main.tf                    # IaC declarativa para LocalStack (S3, DynamoDB com TTL e SNS)
-├── docker-compose.yml             # Orquestração do Eclipse Mosquitto 2.0 e LocalStack 3.8
+├── docker-compose.yml             # Orquestração do Mosquitto 2.0, LocalStack 3.8 e Dashboard Streamlit
 ├── .env.example                   # Modelo de variáveis de ambiente locais
 ├── .gitignore                     # Exclusão de chaves (*.key), .venv e arquivos de estado do Terraform
 └── README.md                      # Documentação principal do projeto
