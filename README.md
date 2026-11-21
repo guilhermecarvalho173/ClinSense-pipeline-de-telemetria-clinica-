@@ -1,6 +1,6 @@
 # ClinSense Fisio Center — Plataforma IoT & Big Data de Telemonitoramento
 
-Plataforma de telemonitoramento biomédico contínuo para **40 pacientes crônicos** (pulseiras vestíveis ESP32-S3), construída sobre arquitetura orientada a eventos com ingestão segura **MQTTS (mTLS X.509)**, processamento paralelo em camadas quente e fria (**Caminho B**: Eclipse Mosquitto + LocalStack 3.8 + Terraform + DuckDB) e **Dashboard de telemonitoramento em tempo real (Streamlit)**.
+Plataforma de telemonitoramento biomédico contínuo para **40 pacientes crônicos** (pulseiras vestíveis ESP32-S3), construída sobre arquitetura orientada a eventos com ingestão segura **MQTTS (mTLS X.509)**, processamento paralelo em camadas quente e fria (**Caminho B**: Eclipse Mosquitto + LocalStack 3.8 + Terraform + DuckDB) e **Dashboard de telemonitoramento em tempo real (Grafana + FastAPI)**.
 
 ---
 
@@ -34,7 +34,7 @@ A solução adota o padrão **Arquitetura Lambda** em execução local container
     │                                        │
     ├──────────────────┬─────────────────────┘
     ▼                  ▼
-[DuckDB SQL]    [Dashboard Streamlit (Porta 8501)]
+[DuckDB SQL]    [Grafana API (8000) ──► Grafana Dashboard (3000)]
 ```
 
 ### Componentes Principais
@@ -45,7 +45,7 @@ A solução adota o padrão **Arquitetura Lambda** em execução local container
 | **Ingestão Paralela** | Python (`paho-mqtt` + `boto3`) | Consome `clinsense/telemetry/#` e despacha simultaneamente cada leitura para o Firehose (camada fria) e para a Lambda (camada quente). |
 | **Camada Quente & Alertas** | AWS Lambda + DynamoDB + SNS/SQS | Persiste leituras em `clinsense_quente` (TTL 24h) e avalia regras clínicas ($BPM > 120$, $BPM < 50$ ou $SpO_2 < 92\%$), disparando alertas no SNS `clinsense-alertas` e gravando em `clinsense_alertas` (TTL 30 dias). |
 | **Camada Fria (Data Lake)** | Amazon Data Firehose + Amazon S3 | Grava registros em JSON cru (NDJSON) no bucket `clinsense-raw-lake` com particionamento temporal (`year/month/day/hour`) e *buffer* de 1 MB ou 5 segundos. |
-| **Visualização em Tempo Real** | Streamlit + Boto3 + DuckDB (dashboard/) | Painel web containerizado na porta 8501 com atualização automática a cada 2s, exibindo KPIs clínicos, gráficos de BPM/SpO2 da frota, tabela de alertas críticos e auditoria DuckDB no S3. |
+| **Visualização em Tempo Real** | Grafana + FastAPI + Infinity Datasource | Painel web provisionado automaticamente na porta 3000 (admin / admin) com atualização a cada 5s, consumindo a micro-API grafana-api (8000) conectada ao DynamoDB e ao DuckDB/S3. |
 | **Analytics & Auditoria** | DuckDB | Executa consultas SQL diretamente sobre os objetos JSON particionados do S3 (`read_json_auto(..., hive_partitioning=true)`), sem necessidade de jobs ETL intermediários para Parquet. |
 | **Infraestrutura como Código** | Terraform (`terraform/main.tf`) | Provisiona declarativamente no LocalStack recursos auditáveis (`clinsense-tf-raw-lake`, `clinsense_tf_quente` com TTL e `clinsense-tf-alertas`). |
 
@@ -59,11 +59,18 @@ clinsense-iot-bigdata/
 │   ├── ca.crt / ca.key            # Autoridade Certificadora raiz (ClinSense-Root-CA)
 │   ├── broker.crt / broker.key    # Certificado TLS do broker Mosquitto (SAN localhost / 127.0.0.1)
 │   └── shared-device.crt / .key   # Certificado X.509 compartilhado pelas 40 pulseiras ESP32-S3
-├── dashboard/                     # Interface visual de telemonitoramento em tempo real (Docker)
-│   ├── app.py                     # Aplicação Streamlit (DynamoDB quente/alertas + consulta S3 DuckDB)
-│   └── Dockerfile                 # Imagem Python 3.11-slim do serviço clinsense-dashboard (porta 8501)
 ├── docs/
 │   └── ADR-001-pipeline.md        # Decisão arquitetural: Caminho B + JSON cru vs. Kafka + Parquet
+├── grafana/                       # Observabilidade e telemonitoramento em tempo real (Docker)
+│   ├── api/
+│   │   ├── Dockerfile             # Imagem Python 3.11-slim do serviço clinsense-grafana-api (porta 8000)
+│   │   └── metrics_api.py         # API FastAPI que consulta DynamoDB (quente/alertas) e S3 via DuckDB
+│   └── provisioning/
+│       ├── datasources/
+│       │   └── infinity.yml       # Provisioning automático do plugin yesoreyeram-infinity-datasource
+│       └── dashboards/
+│           ├── dashboard.yml      # Registro da pasta ClinSense Fisio Center no Grafana
+│           └── clinsense-dashboard.json # Painel pré-configurado (KPIs, alertas clínicos e auditoria S3)
 ├── lambda/                        # Diretório auxiliar para artefatos e empacotamento Lambda
 ├── mosquitto/
 │   └── mosquitto.conf             # Configuração dual-listener (1883 interno e 8883 mTLS obrigatório)
@@ -84,21 +91,21 @@ clinsense-iot-bigdata/
 │   └── query_duckdb.py            # [Auxiliar/Legado] Consulta ad-hoc DuckDB sobre Raw Lake
 ├── terraform/
 │   └── main.tf                    # IaC declarativa para LocalStack (S3, DynamoDB com TTL e SNS)
-├── docker-compose.yml             # Orquestração do Mosquitto 2.0, LocalStack 3.8 e Dashboard Streamlit
+├── docker-compose.yml             # Orquestração do Mosquitto 2.0, LocalStack 3.8, Grafana API e Grafana
 ├── .env.example                   # Modelo de variáveis de ambiente locais
 ├── .gitignore                     # Exclusão de chaves (*.key), .venv e arquivos de estado do Terraform
 └── README.md                      # Documentação principal do projeto
-
 ---
-
+```
 ## 3. Pré-requisitos e Preparação (Windows PowerShell)
 
 Certifique-se de ter **Docker Desktop** em execução, **Python 3.11+** e **Terraform** instalados.
 
 1. **Liberar execução de scripts locais no PowerShell (necessário para `.venv` e `down.ps1`):**
+
    ```powershell
    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-   ```
+   
 
 2. **Criar/ativar o ambiente virtual e instalar as dependências Python:**
    ```powershell
